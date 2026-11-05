@@ -1,0 +1,3 @@
+-r skills/xy-drawing-restore/scripts/requirements.txt
+PyYAML==6.0.3
+reportlab==5.1.0
