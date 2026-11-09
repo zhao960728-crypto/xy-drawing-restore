@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from decimal import Decimal
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -63,6 +64,15 @@ def asset_path(root, relative):
     return path
 
 
+def embedded_images(page):
+    """List PDF image occurrences, without persisting image streams."""
+    return [
+        {'id': f'image-{index:03}', 'box_points': [image[key] for key in ('x0', 'top', 'x1', 'bottom')],
+         'size_pixels': list(image['srcsize']), 'image_mask': bool(image.get('imagemask'))}
+        for index, image in enumerate(page.images, 1)
+    ]
+
+
 def prepare(args):
     from PIL import Image, ImageOps
     root = Path(args.out).resolve()
@@ -100,7 +110,8 @@ def prepare(args):
                                        'width_points': page.width, 'height_points': page.height,
                                        'rotation': page.rotation, 'cropbox': page.cropbox,
                                        'text': page.extract_text() or '', 'chars': page.chars,
-                                       'lines': page.lines, 'rects': page.rects, 'curves': page.curves}
+                                       'lines': page.lines, 'rects': page.rects, 'curves': page.curves,
+                                       'embedded_images': embedded_images(page)}
                         write_json(extracted, native_data)
                         rendered_page = rendered[page_index]
                         try:
@@ -240,6 +251,31 @@ def page_native_dimensions(entities, handles):
     return dimensions
 
 
+def feet_inches_mm(text):
+    normalized = text.translate(str.maketrans({'′': "'", '’': "'", '″': '"', '”': '"', '–': '-'}))
+    match = re.fullmatch(r"""\s*(?:(\d+)\s*'\s*-?\s*)?(?:(\d+(?:[.,]\d+)?)(?!\s*/)[\s-]*)?(?:(\d+\s*/\s*\d+)\s*)?(")?\s*""",
+                         normalized)
+    if not match or (not match[1] and not match[4]) or (not any(match[i] for i in (2, 3)) and match[4]):
+        raise ValueError('Expected a visible feet-and-inches dimension.')
+    try:
+        inches = Fraction((match[2] or '0').replace(',', '.'))
+        inches += Fraction(re.sub(r'\s+', '', match[3])) if match[3] else 0
+        return float((int(match[1] or 0) * 12 + inches) * Fraction('25.4'))
+    except (ValueError, ZeroDivisionError) as error:
+        raise ValueError('Invalid feet-and-inches dimension.') from error
+
+
+def metric_label(text):
+    match = re.fullmatch(
+        r'(?:(\d+)\s*[-x×]\s*)?(?:(M|[RrØøΦφ⌀]|%%c)\s*)?([+-]?\d+(?:[.,]\d+)?)\s*(?:mm|°)?',
+        text.strip())
+    if match is None:
+        return None
+    quantity, prefix, value = match.groups()
+    qualifier = prefix.upper() if prefix in {'M', 'R', 'r'} else 'diameter' if prefix else None
+    return float(value.replace(',', '.')), qualifier, int(quantity) if quantity is not None else None
+
+
 def check_dimension_inventory(page, dimensions, task_tolerance, findings):
     from restoration_geometry import dimension_measurement
 
@@ -257,15 +293,26 @@ def check_dimension_inventory(page, dimensions, task_tolerance, findings):
             seen.add(handle)
             entity = dimensions[handle]
             unit = 'degrees' if entity.dimtype in {2, 5} else 'mm'
-            if row.get('unit') != unit or not str(row.get('source_text', '')).strip():
+            source_text = row.get('source_text')
+            if row.get('unit') != unit or not isinstance(source_text, str) or not source_text.strip():
                 raise ValueError('Record the source annotation text and correct measurement unit.')
             expected = finite_number(row['source_reading'], positive=True)
             limit = .05 if unit == 'degrees' else task_tolerance
             tolerance = finite_number(row.get('tolerance', limit))
             if tolerance > limit:
                 raise ValueError('Dimension tolerance exceeds the allowed check tolerance.')
-            factor = 1 if unit == 'degrees' else finite_number(entity.override().get('dimlfac', 1), positive=True)
-            if factor != 1 and not str(row.get('projection_basis', '')).strip():
+            style = entity.override()
+            factor = 1 if unit == 'degrees' else finite_number(style.get('dimlfac', 1), positive=True)
+            display_unit = row.get('display_unit')
+            if display_unit == 'ft-in':
+                if unit != 'mm' or style.get('dimlunit', 2) not in {3, 4}:
+                    raise ValueError('Feet-and-inches labels need a native engineering or architectural dimension style.')
+                if not math.isclose(feet_inches_mm(source_text), expected, abs_tol=1e-8, rel_tol=0):
+                    raise ValueError('Source feet-and-inches text differs from the recorded millimeter reading.')
+                factor *= 25.4
+            elif display_unit is not None:
+                raise ValueError('Unsupported dimension display unit.')
+            if not math.isclose(factor, 1, abs_tol=1e-12, rel_tol=0) and not str(row.get('projection_basis', '')).strip():
                 raise ValueError('An explicitly projected dimension needs a source projection basis.')
             actual = dimension_measurement(entity)
             error = abs(actual*factor-expected)
@@ -277,10 +324,19 @@ def check_dimension_inventory(page, dimensions, task_tolerance, findings):
                              'visible_text': visible})
             if error > tolerance + 1e-9:
                 raise ValueError('Actual native dimension measurement differs from the source reading.')
-            if len(visible) == 1:
-                scalar = re.fullmatch(r'(?:(?:[RrØøΦφ⌀]|%%c)\s*)?([+-]?\d+(?:[.,]\d+)?)\s*(?:mm|°)?', visible[0])
-                if scalar and not math.isclose(float(scalar[1].replace(',', '.')), expected, rel_tol=0, abs_tol=1e-9):
+            if display_unit == 'ft-in':
+                if len(visible) != 1 or not math.isclose(feet_inches_mm(visible[0]), expected, abs_tol=1e-8, rel_tol=0):
+                    raise ValueError('Visible feet-and-inches text differs from the source reading.')
+            else:
+                scalar = metric_label(visible[0]) if len(visible) == 1 else None
+                source_label = metric_label(source_text)
+                if source_label and not math.isclose(source_label[0], expected, rel_tol=0, abs_tol=1e-9):
+                    raise ValueError('Source dimension text differs from the recorded reading.')
+                if scalar and not math.isclose(scalar[0], expected, rel_tol=0, abs_tol=1e-9):
                     raise ValueError('Visible dimension text differs from the source reading.')
+                if source_label and (source_label[1] == 'M' or source_label[2] is not None):
+                    if scalar is None or source_label[1:] != scalar[1:]:
+                        raise ValueError('Visible dimension thread or quantity qualifier differs from the source.')
         except (KeyError, ValueError, TypeError, NotImplementedError) as error:
             findings.append(label + ': ' + str(error))
     if seen != dimensions.keys():
@@ -292,6 +348,56 @@ def source_assets(manifest_path, manifest):
     root = manifest_path.parent
     return [asset_path(root, source['path']) for source in manifest['sources']] + [
         asset_path(root, page[key]) for page in manifest['pages'] for key in ('preview', 'native') if key in page]
+
+
+def source_image_ids(root, manifest):
+    sources = {source['id']: source for source in manifest['sources']}
+    legacy_pages = {}
+    inventory = {}
+    for page in manifest['pages']:
+        if 'native' not in page:
+            continue
+        native = read_json(asset_path(root, page['native']))
+        if 'embedded_images' in native:
+            inventory[page['id']] = {image['id'] for image in native['embedded_images']}
+        else:
+            legacy_pages.setdefault(page['source_id'], []).append(page)
+    if legacy_pages:
+        import pdfplumber
+        for source_id, pages in legacy_pages.items():
+            with pdfplumber.open(asset_path(root, sources[source_id]['path'])) as pdf:
+                for page in pages:
+                    inventory[page['id']] = {
+                        image['id'] for image in embedded_images(pdf.pages[page['page'] - 1])}
+    return inventory
+
+
+def check_embedded_images(page, expected, page_handles, scope, findings):
+    seen = set()
+    rows = page.get('embedded_images', [])
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        findings.append(page['id'] + ': invalid PDF image restoration inventory.')
+        return
+    for row in rows:
+        image_id = row.get('id')
+        status = row.get('status')
+        handles = row.get('handles', [])
+        tag = f"{page['id']}/{image_id}"
+        if not isinstance(image_id, str) or image_id not in expected or image_id in seen:
+            findings.append(tag + ': unknown or repeated PDF image occurrence.')
+            continue
+        seen.add(image_id)
+        evidence = row.get('evidence')
+        if not isinstance(evidence, str) or not evidence.strip():
+            findings.append(tag + ': record visible content and evidence from the original page.')
+        if status == 'restored':
+            if (not isinstance(handles, list) or not handles or any(not isinstance(h, str) for h in handles)
+                    or not set(handles) <= page_handles):
+                findings.append(tag + ': link the editable entities on this page that restore the PDF image.')
+        elif handles or not (status == 'not_visible' or (status == 'excluded' and scope == 'selected_region')):
+            findings.append(tag + ': PDF image occurrence has unresolved visible content.')
+    for image_id in sorted(expected - seen):
+        findings.append(f"{page['id']}/{image_id}: PDF image occurrence has no restoration disposition.")
 
 
 def check_inputs(manifest_path, dxf_path, record_path):
@@ -343,6 +449,7 @@ def check_inputs(manifest_path, dxf_path, record_path):
     tolerance = finite_number(record.get('tolerance_mm'), positive=True)
     pages = record.get('pages', [])
     expected_ids = {page['id'] for page in manifest['pages']}
+    image_ids = source_image_ids(root, manifest)
     if len(pages) != len(expected_ids) or {page.get('id') for page in pages} != expected_ids:
         findings.append('The record does not cover each original page exactly once.')
     claimed = set()
@@ -409,6 +516,7 @@ def check_inputs(manifest_path, dxf_path, record_path):
                     findings.append(tag + ': ' + str(error))
         dimensions = page_native_dimensions(entities, page_handles)
         dimension_readings.extend(check_dimension_inventory(page, dimensions, tolerance, findings))
+        check_embedded_images(page, image_ids.get(label, set()), page_handles, record.get('scope'), findings)
     if claimed != entities.keys():
         findings.append('Actual modelspace entities are not completely assigned to source pages/regions.')
     return {'automated_checks': 'failed' if findings else 'passed',
@@ -429,14 +537,86 @@ def check(args):
     return result
 
 
-def render_dxf_png(doc, path, selected=None):
+def render_dxf_png(doc, path, selected=None, *, dark=False, frame=None, paper_width_mm=None,
+                   max_edge=1800):
     import matplotlib
     matplotlib.use('Agg')
+    from ezdxf.addons.drawing import RenderContext
     from ezdxf.addons.drawing.config import Configuration
-    from ezdxf.addons.drawing.matplotlib import qsave
-    qsave(doc.modelspace(), str(path), bg='#ffffff', fg='#000000', dpi=240,
-          config=Configuration(min_lineweight=1.5), size_inches=(16, 12),
-          filter_func=None if selected is None else lambda entity: entity.dxf.handle in selected)
+    from ezdxf.addons.drawing.frontend import UniversalFrontend
+    from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+    from ezdxf.addons.drawing.pipeline import RenderPipeline2d
+    from ezdxf.addons.drawing.properties import LayoutProperties
+    from ezdxf.npshapes import to_matplotlib_path
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    from matplotlib.patches import PathPatch
+    from restoration_geometry import OUTLINE_WINDING_APPID
+
+    class PreviewBackend(MatplotlibBackend):
+        use_winding = False
+
+        def draw_filled_paths(self, paths, properties):
+            if not self.use_winding:
+                return super().draw_filled_paths(paths, properties)
+            # Source outlines already encode their winding. Guessing holes
+            # by geometry can fill parts of a glyph or miss nested rings.
+            paths = list(paths)
+            if paths:
+                glyph = to_matplotlib_path(paths)
+                self.ax.add_patch(PathPatch(glyph, color=properties.color, linewidth=0, zorder=self._get_z()))
+
+    class PreviewPipeline(RenderPipeline2d):
+        def draw_text(self, *args, **kwargs):
+            backend.use_winding = True
+            try:
+                super().draw_text(*args, **kwargs)
+            finally:
+                backend.use_winding = False
+
+    class PreviewFrontend(UniversalFrontend):
+        def draw_hatch_entity(self, entity, properties, **kwargs):
+            backend.use_winding = entity.has_xdata(OUTLINE_WINDING_APPID)
+            try:
+                super().draw_hatch_entity(entity, properties, **kwargs)
+            finally:
+                backend.use_winding = False
+
+    bg, fg = ('#000000', '#ffffff') if dark else ('#ffffff', '#000000')
+    size = (16, 12)
+    minimum_line = 1.5
+    lineweight_scaling = 1.0
+    if frame is not None:
+        x0, y0, x1, y1 = frame
+        width, height = x1 - x0, y1 - y0
+        scale = max_edge / max(width, height)
+        size = (max(1, round(width*scale))/240, max(1, round(height*scale))/240)
+        minimum_line = .75 if dark else .50
+    if paper_width_mm is not None:
+        # The backend takes pen widths in points. For a registered PDF
+        # canvas, scale the source's paper millimeters to the same pixels.
+        lineweight_scaling = size[0] * 72 / paper_width_mm
+        minimum_line = .10
+    fig = Figure(figsize=size, dpi=240, facecolor=bg)
+    FigureCanvasAgg(fig)
+    ax = fig.add_axes((0, 0, 1, 1))
+    backend = PreviewBackend(ax, adjust_figure=False)
+    model = doc.modelspace()
+    layout = LayoutProperties.from_layout(model)
+    layout.set_colors(bg, fg)
+    config = Configuration(min_lineweight=minimum_line, lineweight_scaling=lineweight_scaling)
+    filter_func = None if selected is None else lambda entity: entity.dxf.handle in selected
+    PreviewFrontend(RenderContext(doc), PreviewPipeline(backend), config).draw_layout(
+        model, layout_properties=layout, filter_func=filter_func)
+    if frame is not None:
+        left, bottom, right, top = ax.dataLim.extents
+        margin = 2 / scale
+        if (all(math.isfinite(v) for v in (left, bottom, right, top))
+                and (left < x0 - margin or bottom < y0 - margin or right > x1 + margin or top > y1 + margin)):
+            raise ValueError(f'Review viewport {frame} would clip CAD bounds {[left, bottom, right, top]}.')
+        ax.set_xlim(x0, x1)
+        ax.set_ylim(y0, y1)
+    fig.savefig(path, dpi=240, facecolor=bg)
 
 
 def preview(args):

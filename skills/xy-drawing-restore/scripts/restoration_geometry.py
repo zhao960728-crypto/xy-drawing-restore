@@ -3,6 +3,8 @@
 """Geometry helpers for source-derived restoration in an isolated local workspace."""
 import math
 
+OUTLINE_WINDING_APPID = 'XY_RESTORE_WINDING'
+
 
 def bounded_bezier_polyline(control_points, tolerance_mm):
     """Approximate an analytic cubic with a two-sided convex-hull error bound.
@@ -181,6 +183,144 @@ def restore_raster_ornament(layout, grayscale, region, pixel_to_cad, *, threshol
     return {'source_region': list(region), 'threshold': threshold, 'handles': handles,
             'connected_ink_regions': len(polygons), 'holes': sum(len(loops)-1 for loops in polygons),
             'touches_region_border': bool((border < threshold).any()), 'not_a_quality_review': True}
+
+
+def add_filled_paths(layout, contours, *, even_odd=False, dxfattribs=None):
+    """Resolve overlapping closed source outlines by their original fill rule."""
+    from shapely.geometry import LineString
+    from shapely.ops import polygonize, unary_union
+
+    rings = []
+    for contour in contours:
+        points = [tuple(point) for point in contour]
+        if any(len(p) != 2 or not all(math.isfinite(v) for v in p) for p in points):
+            raise ValueError('Filled paths require finite planar contours')
+        if len(set(points)) < 3:
+            continue
+        if points[0] != points[-1]:
+            points.append(points[0])
+        rings.append(points)
+    faces = polygonize(unary_union([LineString(ring) for ring in rings]))
+
+    def winding(ring, x, y):
+        count = 0
+        for (ax, ay), (bx, by) in zip(ring, ring[1:]):
+            side = (bx - ax) * (y - ay) - (x - ax) * (by - ay)
+            if ay <= y < by and side > 0:
+                count += 1
+            elif by <= y < ay and side < 0:
+                count -= 1
+        return count
+
+    filled = []
+    for face in faces:
+        point = face.representative_point()
+        number = sum(winding(ring, point.x, point.y) for ring in rings)
+        if (number % 2 if even_odd else number != 0):
+            filled.append(face)
+    combined = unary_union(filled)
+    polygons = [combined] if combined.geom_type == 'Polygon' else combined.geoms
+    return [_polygon_hatch(layout, polygon, dxfattribs) for polygon in polygons if not polygon.is_empty]
+
+
+def _polygon_hatch(layout, polygon, dxfattribs):
+    from shapely.geometry.polygon import orient
+
+    polygon = orient(polygon, sign=1)
+    hatch = layout.add_hatch(dxfattribs=dxfattribs)
+    hatch.dxf.hatch_style = 0
+    for index, ring in enumerate((polygon.exterior, *polygon.interiors)):
+        hatch.paths.add_polyline_path(list(ring.coords[:-1]), is_closed=True, flags=1 if index == 0 else 0)
+    if not layout.doc.appids.has_entry(OUTLINE_WINDING_APPID):
+        layout.doc.appids.new(OUTLINE_WINDING_APPID)
+    hatch.set_xdata(OUTLINE_WINDING_APPID, [(1070, 1)])
+    return hatch
+
+
+def restore_color_artwork(layout, image, pixel_to_cad, *, colors=24, matte=(255, 255, 255),
+                          matte_tolerance=0, denoise_pixels=0, source_palette=None, dxfattribs=None):
+    """Rebuild image colors as editable contour fills, retaining holes and alpha edges.
+
+    The caller selects an actual source image occurrence and checks its details
+    against the original. This is an appearance reconstruction, not recognition.
+    """
+    import numpy as np
+    from contourpy import contour_generator
+    from PIL import Image, ImageFilter
+    from shapely.geometry import Polygon
+
+    if not 2 <= colors <= 64 or image.width * image.height > 2_000_000:
+        raise ValueError('Select the artwork and use a bounded color palette')
+    def valid_rgb(color):
+        return len(color) == 3 and all(type(v) is int and 0 <= v <= 255 for v in color)
+
+    if matte is not None and not valid_rgb(matte):
+        raise ValueError('Matte must be an RGB color or None')
+    if source_palette is not None and (not 2 <= len(source_palette) <= 64
+                                       or not all(valid_rgb(color) for color in source_palette)):
+        raise ValueError('Source palette must contain 2 to 64 observed RGB colors')
+    if not 0 <= matte_tolerance <= 32 or not 0 <= denoise_pixels <= 1:
+        raise ValueError('Use a bounded matte tolerance and optional subpixel denoising')
+    rgba = image.convert('RGBA')
+    background = Image.new('RGBA', rgba.size, (*(matte or (255, 255, 255)), 255))
+    rgb = Image.alpha_composite(background, rgba).convert('RGB')
+    active = np.asarray(rgba.getchannel('A')) > 0
+    if matte is not None:
+        active &= np.max(np.abs(np.asarray(rgb, dtype=np.int16) - matte), axis=2) > matte_tolerance
+    if not active.any():
+        return []
+    # Exclude the matte from palette estimation so large white margins do
+    # not cost the original colors or force light artwork into the matte.
+    if denoise_pixels:
+        rgb = rgb.filter(ImageFilter.GaussianBlur(denoise_pixels))
+    indices = np.full(active.shape, -1)
+    samples = np.asarray(rgb)[active]
+    if source_palette is None:
+        packed = Image.fromarray(samples.reshape(1, -1, 3))
+        indexed = packed.quantize(colors=colors, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+        indices[active] = np.asarray(indexed).ravel()
+        palette = np.array(indexed.getpalette()).reshape(-1, 3)
+    else:
+        palette = source_palette
+        samples = samples.astype(np.int32)
+        labels = np.zeros(len(samples), dtype=np.intp)
+        nearest = np.full(len(samples), np.iinfo(np.int32).max, dtype=np.int32)
+        for index, color in enumerate(palette):
+            distance = np.square(samples - color).sum(axis=1)
+            better = distance < nearest
+            labels[better] = index
+            nearest[better] = distance[better]
+        indices[active] = labels
+    result = []
+
+    def paint(mask, index):
+        generator = contour_generator(z=np.pad(mask, 1).astype(float), fill_type='OuterOffset')
+        vertices, offsets = generator.filled(.5, 1.5)
+        attrs = dict(dxfattribs or {})
+        r, g, b = map(int, palette[index])
+        attrs['true_color'] = (r << 16) | (g << 8) | b
+        for coords, ends in zip(vertices, offsets):
+            loops = [coords[a:b] - .5 for a, b in zip(ends, ends[1:])]
+            poly = Polygon(loops[0], loops[1:])
+            simplified = poly.simplify(.12, preserve_topology=True)
+            if len(simplified.interiors) == len(poly.interiors):
+                poly = simplified
+            mapped = [pixel_to_cad(np.asarray(ring.coords[:-1])) for ring in (poly.exterior, *poly.interiors)]
+            if any(not np.isfinite(v).all() for v in mapped):
+                raise ValueError('Artwork transform must produce finite CAD points')
+            transformed = Polygon(mapped[0], mapped[1:])
+            if not transformed.is_valid:
+                raise ValueError('Artwork transform changes contour topology')
+            result.append(_polygon_hatch(layout, transformed, attrs))
+    # A continuous underpaint avoids white antialias seams between adjacent
+    # independent fills. It follows the same silhouette, including holes.
+    populated = indices[active]
+    dominant = int(np.bincount(populated).argmax())
+    paint(active, dominant)
+    for index in np.unique(populated):
+        if index != dominant:
+            paint(indices == index, int(index))
+    return result
 
 
 def dimension_measurement(entity):

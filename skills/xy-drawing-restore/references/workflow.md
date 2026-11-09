@@ -7,7 +7,8 @@
 `prepare --out 新建或空目录 原稿1 原稿2 ...`生成：
 
 - `manifest.json`：本次来源、哈希、全部页/帧清单；`physical_scale_verified`初始为false。
-- `originals/`：原稿原字节副本；`pages/`：逐页PNG；`native/`：PDF原生chars/lines/rects/curves及文本。
+- `originals/`：原稿原字节副本；`pages/`：逐页PNG；`native/`：PDF文字、路径和嵌入图片位置清单。图片清单使用与原生路径相同的页坐标，可结合逐页 PNG 定位。
+- 自定义 PDF 字体的字符编码有时只是签名、章印或符号的索引。以实际显示轮廓为准。已有来源轮廓时，用有界折线及 `add_filled_paths` 按原始填充规则还原，保留孔洞、重叠和颜色。嵌入式彩色图像可用 `restore_color_artwork` 恢复为可编辑色块。对少量但有意义的颜色，使用从原稿采样的 `source_palette`；原图内部白色确属图案时可用 `matte=None`。逐项比对边缘、孔、层次和遮挡。
 - 页ID如`s1-p1`。PDF原生坐标和渲染页尺寸均保留，注意旋转/cropbox可能不同。原生路径不是已确认的毫米几何。
 
 多帧TIFF和动画图逐帧列出；拍照图先应用EXIF方向。所有页须看实际PNG。PDF隐藏/裁剪/遮挡路径可能不属于可见原图，须对照渲染后再取用。文本和尺寸原文按原稿保留，不以通用OCR结论替代图像核对。扫描图不使用固定轮廓模板，应为当前原稿编程拟合；可解析圆弧优先恢复为原生ARC/CIRCLE，不为减少代码丢掉文字或视图。
@@ -31,7 +32,8 @@
 ## 逐页对照和正式交付
 
 1. 在每个实际视图或有独立细节的区域填 `source_box_px`，用 `prepare` 输出的原稿 PNG 的 `[左, 上, 右, 下]` 像素坐标。每页从原稿统计 `source_dimension_count`，将原图读数逐项关联到实际 DIMENSION；确无标注时填 `no_dimensions_reason`。比例以真实轮廓或特征为锚点，单独量尺寸对象不足以证明图形尺度。
-2. 运行 `review-pack --manifest manifest.json --dxf 当前图.dxf --record 核对记录.json --out 新对照目录`。逐页读取 `*.compare.png`，左侧为原稿、右侧为从实际 DXF 生成的预览。布局看整页，细节逐区域放大。工具保留原图和 DXF 的绘制关系及文件指纹。
+2. 运行 `review-pack --manifest manifest.json --dxf 当前图.dxf --record 核对记录.json --out 新对照目录`。逐页读取 `*.compare.png`，左侧为原稿、右侧为从实际 DXF 生成的预览。布局看整页，细节逐区域放大。对有可靠页框或比例基准的图，在页记录及区域内填 `cad_box_mm`，顺序为 `[最小X, 最小Y, 最大X, 最大Y]`。该窗口对应整页或 `source_box_px` 的同一范围，保留空白和相对位置。窗口不得裁去已恢复内容。黑底原稿的对照沿用黑底。
+   矢量 PDF 若已把来源纸面线重写入 DXF，可在注册了页框的页记录启用 `paper_lineweights: true`。整页和局部预览按原稿纸面尺寸计算线宽。
 3. 复制 `review-template.json` 写实际核对结果。记录 `reviewer` 和 `review_type`（`self_review` 或 `independent_review`），保留对照文件指纹。逐页和逐区填写 `status`，以及问题 `findings`。在各区的六个 `checks` 字段写具体对照依据。举例时指出轮廓拐点、墙体开口、设备遮挡或原生标注的实际位置。某类内容原稿无对应项时，写明核对到的范围。遇到差异先修图并重新生成对照。
 4. 运行 `deliver --manifest manifest.json --dxf 当前图.dxf --record 核对记录.json --pack 对照目录/review-pack.json --review 实际核对.json --out 新交付目录`。通过后逐页生成同名 DXF/PNG 和 `delivery.json`。交付前重新核对源文件、候选字节、原生尺寸、全部页和区域、视觉证据以及实际保存的分图。内部预览和未解决稿保留在工作区。
 
@@ -85,6 +87,9 @@
 - `anchors.kind`支持`line_length`（单个LINE）、`circle_diameter`（单个CIRCLE）、`arc_radius`（单个ARC）、`bbox_width/bbox_height`（这些句柄的总体包围盒）和`dimension_measurement`（单个线性DIMENSION，不支持角度）。`handles`须属于当前region；`expected_mm`必须为有限正数，单项容差不得超过任务容差，误差取绝对毫米值。
 - `source_basis`仅用`dimension`、`explicit_scale`或`user_reference`；写清原文、位置和推导。纸张比例只有原图明确且能确认对应视图时才适用；没有来源不能写verified。
 - 每页 `dimensions` 登记从原稿识出的全部尺寸。每条记录填写实际 `handle`、`source_text`、`source_reading` 和 `unit`（`mm` 或 `degrees`）。可填写更严格的 `tolerance`。涉及显式投影比例时记录 `projection_basis`。源图确无标注时保留空数组。核对结果还会检查块内的原生尺寸和样条边界。散线和文字漏标须结合原稿视觉核对。
+- 对英尺英寸标注，保留 `source_text` 的原始写法，填 `display_unit: "ft-in"` 并将 `source_reading` 换算为毫米。原生尺寸样式使用 Engineering 或 Architectural，并以 `DIMLFAC = 1 / 25.4` 把毫米模型值转换为英寸显示。保存后检查原生定义及实际显示块的读数。
+- 直径、螺纹和重复孔标注保留原稿读数与数量前缀，例如 `2-M12`。数量、螺纹符号和量值分别核对，仍以原生尺寸实体保存。
+- PDF 原生清单中的每个 `embedded_images` 项在页记录内用同名字段逐项登记 `id`、`status` 和原稿核对 `evidence`。可见且完整还原的项填 `restored`，同时提供本页实际可编辑实体的 `handles`。原稿中经核对确实不可见的项填 `not_visible` 并说明依据。用户只授权指定区域时，可为范围外项填 `excluded` 并说明位置。看得到但没恢复完整的项填 `unresolved`，保留在内部核对。章印、图标、插图和遮挡均要看原稿渲染，嵌入图片清单只覆盖解析器检测到的图片。
 - 有不确定原文或尺度时登记 `unresolved` 并留在内部核对。参考记录须对照原稿和实际几何核实，`expected_mm` 取自原稿或明确的用户参考。
 
 ## 最终说明

@@ -36,6 +36,23 @@ def _payload(entity, stack=()):
         if name in stack:raise ValueError('Cyclic CAD blocks cannot be exported')
         return {'base':list(layout.block.dxf.base_point),
                 'entities':[_payload(e,(*stack,name)) for e in layout.entities_in_redraw_order()]}
+    def dimension_overrides():
+        overrides = dict(entity.override().dimstyle_attribs)
+        for key in ('dimtxsty', 'dimblk', 'dimblk1', 'dimblk2', 'dimldrblk',
+                    'dimltype', 'dimltex1', 'dimltex2'):
+            name = overrides.get(key)
+            if not name:
+                continue
+            if key == 'dimtxsty':
+                overrides[key] = table(doc.styles.get(name))
+            elif key in {'dimblk', 'dimblk1', 'dimblk2', 'dimldrblk'}:
+                layout = doc.blocks.get(name)
+                if layout is None:
+                    layout = doc.blocks.get('_' + name)
+                overrides[key] = block(layout) if layout is not None else name
+            else:
+                overrides[key] = table(doc.linetypes.get(name))
+        return overrides
     collector=TagCollector(dxfversion=doc.dxfversion)
     entity.export_dxf(collector)
     skip={5,105,1005,*range(320,370),*range(390,400),480,481}
@@ -56,6 +73,7 @@ def _payload(entity, stack=()):
     elif kind=='DIMENSION':
         result['display']=block(entity.get_geometry_block())
         result['style']=table(doc.dimstyles.get(entity.dxf.dimstyle))
+        result['overrides'] = dimension_overrides()
     elif kind=='POLYLINE':result['vertices']=[_payload(v,stack) for v in entity.vertices]
     return result
 

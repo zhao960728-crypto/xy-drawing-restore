@@ -13,6 +13,7 @@ import uuid
 import ezdxf
 import numpy as np
 from PIL import Image, ImageDraw
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 import yaml
@@ -21,7 +22,11 @@ BASE = Path(__file__).resolve().parents[1]
 PACKAGE = BASE / 'skills/xy-drawing-restore'
 SCRIPT = PACKAGE / 'scripts/restore_tools.py'
 sys.path.insert(0, str(SCRIPT.parent))
-from restoration_geometry import add_cubic_chain, add_native_linear_dimension, restore_raster_ornament
+from delivery import cad_frame, paper_width, source_is_dark
+from page_exports import verify_page_dxf
+from restoration_geometry import (add_cubic_chain, add_filled_paths, add_native_linear_dimension,
+                                  restore_color_artwork, restore_raster_ornament)
+from restore_tools import check_dimension_inventory, check_embedded_images, feet_inches_mm, render_dxf_png, source_image_ids
 RUN = BASE / 'work' / ('verification-' + uuid.uuid4().hex[:8])
 RUN.mkdir(parents=True, exist_ok=True)
 
@@ -246,6 +251,25 @@ detail = restore_raster_ornament(geometry, gray, [0, 0, 32, 24], lambda p: p)
 assert detail['holes'] == 1 and detail['connected_ink_regions'] == 2
 assert not detail['touches_region_border'] and all(geometry_doc.entitydb[h].dxftype() == 'HATCH' for h in detail['handles'])
 
+outer = [(0, 0), (10, 0), (10, 10), (0, 10)]
+inner = [(2, 2), (8, 2), (8, 8), (2, 8)]
+ring = add_filled_paths(geometry, [outer, inner], even_odd=True)
+assert len(ring) == 1 and len(ring[0].paths) == 2
+solid = add_filled_paths(geometry, [outer, inner])
+assert len(solid) == 1 and len(solid[0].paths) == 1
+art = Image.new('RGB', (40, 30), 'white')
+art_draw = ImageDraw.Draw(art)
+art_draw.rectangle((3, 3, 19, 26), fill='brown')
+art_draw.rectangle((20, 3, 36, 26), fill='orange')
+art_draw.rectangle((14, 10, 25, 18), fill='white')
+fills = restore_color_artwork(geometry, art, lambda points: points)
+assert len(fills) == 2 and len(fills[0].paths) == 2
+assert len({entity.dxf.true_color for entity in fills}) == 2
+manual_palette = [(255, 255, 255), (165, 42, 42), (255, 165, 0)]
+with_white = restore_color_artwork(geometry, art, lambda points: points, matte=None,
+                                    source_palette=manual_palette)
+assert {entity.rgb for entity in with_white} == set(manual_palette)
+
 block = doc.blocks.new('RASTER_TEST')
 image_def = doc.add_image_def(filename='external-source.png', size_in_pixel=(800, 500))
 block.add_image(image_def, insert=(0, 0), size_in_units=(120, 60))
@@ -274,6 +298,110 @@ preview_record = RUN / 'protected.preview.json'
 preview_record.write_bytes(record_path.read_bytes()); before = sha(preview_record)
 invoke('preview', '--dxf', dxf, '--record', preview_record, '--out', RUN / 'protected.png', expected=2)
 assert sha(preview_record) == before
+
+mixed_pdf = RUN / 'mixed-source.pdf'
+canvas_with_image = canvas.Canvas(str(mixed_pdf), pagesize=(100, 50))
+canvas_with_image.drawImage(ImageReader(Image.new('RGB', (8, 6), 'red')), 10, 12, 20, 15)
+canvas_with_image.showPage()
+canvas_with_image.save()
+mixed_path = Path(invoke('prepare', '--out', RUN / 'mixed-frozen', mixed_pdf)['manifest'])
+mixed_manifest = json.loads(mixed_path.read_bytes())
+mixed_native = mixed_path.parent / mixed_manifest['pages'][0]['native']
+mixed_data = json.loads(mixed_native.read_bytes())
+assert mixed_data['embedded_images'] == [
+    {'id': 'image-001', 'box_points': [10, 23, 30, 38], 'size_pixels': [8, 6], 'image_mask': False}]
+
+for inventory in (mixed_data, {key: value for key, value in mixed_data.items() if key != 'embedded_images'}):
+    write(mixed_native, inventory)
+    assert source_image_ids(mixed_path.parent, mixed_manifest) == {'s1-p1': {'image-001'}}
+    for status, handles, scope, passing in (
+            (None, [], 'entire_source', False),
+            ('restored', ['1'], 'entire_source', True),
+            ('restored', ['2'], 'entire_source', False),
+            ('unresolved', [], 'entire_source', False),
+            ('excluded', [], 'entire_source', False),
+            ('excluded', [], 'selected_region', True)):
+        record_page = {'id': 's1-p1'}
+        if status is not None:
+            record_page['embedded_images'] = [
+                {'id': 'image-001', 'status': status, 'handles': handles, 'evidence': 'Visible synthetic red region.'}]
+        findings = []
+        check_embedded_images(record_page, {'image-001'}, {'1'}, scope, findings)
+        assert (not findings) == passing, findings
+
+dark_page = Image.new('RGB', (200, 100), 'black')
+ImageDraw.Draw(dark_page).rectangle((45, 45, 150, 55), fill='cyan')
+assert source_is_dark(dark_page) and not source_is_dark(image)
+frame_doc = ezdxf.new('R2010')
+frame_doc.modelspace().add_line((0, 0), (30, 0))
+frame_output = RUN / 'registered-dark.png'
+frame = cad_frame({'cad_box_mm': [-50, -25, 50, 25]}, dark_page)
+assert paper_width({'render_size_points': [720, 360]}, {'paper_lineweights': True}, frame, 200) == 254
+assert paper_width({'render_size_points': [720, 360]}, {'paper_lineweights': True}, frame, 200, [50, 0, 150, 90]) == 127
+render_dxf_png(frame_doc, frame_output, dark=True, frame=frame)
+with Image.open(frame_output) as registered:
+    pixels = np.asarray(registered.convert('RGB'))
+    assert pixels.shape == (900, 1800, 3)
+    assert pixels[445:455, 950:1400].max() > 210
+    assert pixels[445:455, :880].max() == 0 and pixels[5, 5].max() == 0
+for invalid in (([-50, -25, 50, 15], 'aspect'), ([-20, -10, 20, 10], 'clip')):
+    coordinates, message = invalid
+    try:
+        candidate = cad_frame({'cad_box_mm': coordinates}, dark_page)
+        render_dxf_png(frame_doc, frame_output, dark=True, frame=candidate)
+    except ValueError as error:
+        assert message in str(error)
+    else:
+        raise AssertionError('Invalid review viewport was accepted.')
+
+assert feet_inches_mm('11 1/2"') == 292.1
+assert feet_inches_mm('6′ - 3 1/2″') == 1917.7
+feet_doc = ezdxf.new('R2010', units=4)
+feet_dim = feet_doc.modelspace().add_linear_dim((0, 120), (0, 0), (1752.6, 0),
+    dimstyle='Standard', override={'dimlfac': 1/25.4, 'dimlunit': 4, 'dimtxt': 48})
+feet_dim.render()
+feet_entity = feet_dim.dimension
+feet_mark = feet_entity.get_geometry_block().query('MTEXT').first
+feet_mark.text = '5\'-9"'
+foot_page = {'id': 'fixture', 'dimensions': [
+    {'handle': feet_entity.dxf.handle, 'unit': 'mm', 'display_unit': 'ft-in',
+     'source_text': feet_mark.text, 'source_reading': 1752.6}]}
+findings = []
+check_dimension_inventory(foot_page, {feet_entity.dxf.handle: feet_entity}, .05, findings)
+assert not findings
+feet_mark.text = '5\'-8"'
+check_dimension_inventory(foot_page, {feet_entity.dxf.handle: feet_entity}, .05, findings)
+assert any('Visible feet-and-inches' in finding for finding in findings)
+
+thread_dim = feet_doc.modelspace().add_aligned_dim((0, 0), (12, 0), 3, text='2-M<>',
+    dimstyle='Standard', override={'dimdec': 0})
+thread_dim.render()
+thread = thread_dim.dimension
+thread_mark = thread.get_geometry_block().query('MTEXT').first
+thread_page = {'id': 'thread-fixture', 'dimensions': [
+    {'handle': thread.dxf.handle, 'unit': 'mm', 'source_text': '2-M12', 'source_reading': 12}]}
+assert thread_mark.plain_text() == '2-M12'
+findings = []
+check_dimension_inventory(thread_page, {thread.dxf.handle: thread}, .05, findings)
+assert not findings
+thread_mark.text = '1-M12'
+check_dimension_inventory(thread_page, {thread.dxf.handle: thread}, .05, findings)
+assert any('quantity qualifier' in finding for finding in findings)
+
+feet_mark.text = '5\'-9"'
+different_style = RUN/'changed-dimension-style.dxf'
+changed = feet_entity.override()
+changed.update({'dimlfac':1, 'dimlunit':2})
+changed.commit()
+feet_doc.saveas(different_style)
+feet_dim.commit()
+try:
+    verify_page_dxf(feet_doc.units, list(feet_doc.modelspace()), different_style)
+except ValueError as error:
+    assert 'styles' in str(error)
+else:
+    raise AssertionError('Readback accepted a change to the native dimension overrides.')
+
 meta = yaml.safe_load((PACKAGE / 'SKILL.md').read_text(encoding='utf-8').split('---', 2)[1])
 assert meta['name'] == 'xy-drawing-restore' and meta['metadata']['version'] == '1.0.3'
 assert meta['metadata']['author'] == 'XY (zhao960728-crypto)'

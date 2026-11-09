@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Build source/DXF comparisons and publish only a fully reviewed restoration."""
 from contextlib import contextmanager
+import math
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
@@ -73,7 +74,7 @@ def item(path):
     return {'path': path.name, 'sha256': sha(path)}
 
 
-def comparison(source, rendered, output, source_box=None):
+def source_panel(source, source_box=None):
     from PIL import Image, ImageOps
 
     with Image.open(source) as image:
@@ -83,12 +84,57 @@ def comparison(source, rendered, output, source_box=None):
                             and 0 <= source_box[1] < source_box[3] <= image.height)):
                 raise ValueError('Review region is outside the source preview pixels.')
             image = image.crop(source_box)
-        left = ImageOps.contain(image.convert('RGB'), (1800, 1800))
+        return ImageOps.contain(image.convert('RGB'), (1800, 1800))
+
+
+def source_is_dark(panel):
+    from PIL import ImageOps
+
+    sample = ImageOps.contain(panel, (128, 128))
+    w, h = sample.size
+    dx, dy = max(1, w // 20), max(1, h // 20)
+    border = [pixel for i, pixel in enumerate(sample.get_flattened_data())
+              if i % w < dx or i % w >= w - dx or i // w < dy or i // w >= h - dy]
+    return sum(max(pixel) < 64 and max(pixel) - min(pixel) < 20 for pixel in border) >= .85 * len(border)
+
+
+def cad_frame(row, source_panel):
+    frame = row.get('cad_box_mm')
+    if frame is None:
+        return None
+    if (not isinstance(frame, list) or len(frame) != 4
+            or any(type(v) not in {float, int} or not math.isfinite(v) for v in frame)
+            or not (frame[0] < frame[2] and frame[1] < frame[3])):
+        raise ValueError('Review viewport must be four finite, increasing CAD coordinates.')
+    cad_aspect = (frame[2] - frame[0]) / (frame[3] - frame[1])
+    if not math.isclose(cad_aspect, source_panel.width / source_panel.height, rel_tol=.01):
+        raise ValueError('Review viewport aspect does not match the source page or crop.')
+    return frame
+
+
+def paper_width(page, record_page, frame, source_width, crop_box=None):
+    if not record_page.get('paper_lineweights'):
+        return None
+    if frame is None or 'render_size_points' not in page:
+        raise ValueError('Source paper lineweights require a registered PDF viewport.')
+    width = page['render_size_points'][0] * 25.4 / 72
+    if crop_box is not None:
+        width *= (crop_box[2] - crop_box[0]) / source_width
+    if not math.isfinite(width) or width <= 0:
+        raise ValueError('Source paper width must be positive.')
+    return width
+
+
+def comparison(left, rendered, output, *, aligned=False, dark=False):
+    from PIL import Image, ImageOps
+
     if rendered:
         with Image.open(rendered) as image:
-            right = ImageOps.contain(image.convert('RGB'), (1800, 1800))
+            right = image.convert('RGB')
+            right = (right.resize(left.size, Image.Resampling.LANCZOS) if aligned
+                     else ImageOps.contain(right, (1800, 1800)))
     else:
-        right = Image.new('RGB', left.size, 'white')
+        right = Image.new('RGB', left.size, 'black' if dark else 'white')
     canvas = Image.new('RGB', (left.width+right.width+24, max(left.height, right.height)), '#d9d9d9')
     canvas.paste(left, (0, 0))
     canvas.paste(right, (left.width+24, 0))
@@ -96,6 +142,8 @@ def comparison(source, rendered, output, source_box=None):
 
 
 def review_pack(args):
+    from PIL import Image
+
     manifest_path, manifest, pages, bindings, doc, ordered, redraw = load_scope(args)
     with new_directory(args.out) as stage:
         rows = []
@@ -104,23 +152,37 @@ def review_pack(args):
             source = asset_path(manifest_path.parent, page['preview'])
             if sha(source) != page['preview_sha256']:
                 raise ValueError('Source preview changed: ' + page_id)
+            left = source_panel(source)
+            dark = source_is_dark(left)
+            record_page = pages[page_id]
+            frame = cad_frame(record_page, left)
+            with Image.open(source) as original:
+                source_width = original.width
+                preview_edge = min(3600, max(1800, *original.size))
+            width_mm = paper_width(page, record_page, frame, source_width)
             stem = f'page-{index:03}'
             dxf, png = stage/(stem+'.dxf'), stage/(stem+'.png')
             has_entities = bool(ordered[page_id])
             if has_entities:
                 saved = write_page_dxf(doc, ordered[page_id], redraw[page_id], dxf)
-                render_dxf_png(saved, png)
+                render_dxf_png(saved, png, dark=dark, frame=frame, paper_width_mm=width_mm,
+                               max_edge=preview_edge)
             overall = stage/(stem+'.compare.png')
-            comparison(source, png if has_entities else None, overall)
+            comparison(left, png if has_entities else None, overall, aligned=frame is not None, dark=dark)
             regions = []
-            for region_index, region in enumerate(pages[page_id]['regions'], 1):
+            for region_index, region in enumerate(record_page['regions'], 1):
                 region_stem = f'{stem}.region-{region_index:03}'
                 detail = stage/(region_stem+'.png')
                 handles = set(region['handles'])
+                crop_box = region.get('source_box_px')
+                crop = source_panel(source, crop_box)
+                region_frame = cad_frame(region, crop)
                 if handles:
-                    render_dxf_png(doc, detail, handles)
+                    crop_width_mm = paper_width(page, record_page, region_frame, source_width, crop_box)
+                    render_dxf_png(doc, detail, handles, dark=dark, frame=region_frame,
+                                   paper_width_mm=crop_width_mm)
                 panel = stage/(region_stem+'.compare.png')
-                comparison(source, detail if handles else None, panel, region.get('source_box_px'))
+                comparison(crop, detail if handles else None, panel, aligned=region_frame is not None, dark=dark)
                 regions.append({'id': region['id'], 'comparison': item(panel),
                                 'render': item(detail) if handles else None})
             rows.append({'id': page_id, 'source_preview_sha256': sha(source), 'comparison': item(overall),
