@@ -1,6 +1,6 @@
 # XY图纸1比1还原
 
-在具备识图、文件操作和 Python 命令执行能力的 AI 助手中，协助将 PDF、扫描图或照片还原为可编辑 DXF，生成 PNG 预览和尺寸参考核对记录。
+独立的图纸还原项目。配合具备识图、文件操作和 Python 执行能力的 AI 助手，将 PDF、扫描图或照片还原为可编辑 DXF，并生成 PNG 预览和尺寸核对记录。
 
 当前源码 **1.0.3**，最近发布版 **1.0.2**。作者 **XY（GitHub：zhao960728-crypto）**。
 
@@ -10,13 +10,13 @@
 
 使用者需要 Python 3.10+、venv/pip 和自己的 AI 助手账号。模型识图与编程使用当前助手的能力；配套脚本不含模型、OCR 或独立的扫描矢量化引擎，不会单独自动还原任意图纸。
 
-首次安装在本次任务目录内创建虚拟环境：
+首次安装在本次任务目录内创建虚拟环境，并从 PyPI 安装依赖。
 
 ```powershell
 python "skills/xy-drawing-restore/scripts/bootstrap.py" --env "C:/my-drawing-task/.venv"
 ```
 
-运行环境路径由使用者自行选择，不要放进原稿目录。脚本接口、命令示例和核对记录格式见 [workflow.md](skills/xy-drawing-restore/references/workflow.md)。
+运行环境放在原稿目录之外。原稿由使用者选择的 AI 助手按其平台规则处理。脚本接口、命令示例和核对记录格式见 [workflow.md](skills/xy-drawing-restore/references/workflow.md)。
 
 ## 交付与边界
 
@@ -25,9 +25,7 @@ python "skills/xy-drawing-restore/scripts/bootstrap.py" --env "C:/my-drawing-tas
 - 可编辑曲线使用原生圆弧或有误差边界的连续多段线。局部复杂花纹保留轮廓与空隙，尺寸使用原生 DIMENSION 并从实际文件回读。
 - 逐页比较原稿与实际 DXF，放大核对复杂区域。通过结构检查、尺寸回读和视觉核对后，用 `deliver` 生成逐页同名 DXF 与 PNG。
 - 自动检查覆盖已声明的实体和尺寸参考，完整图形、孔位、文字和视图关系仍须逐页视觉复核。
-- 默认 0.05 mm 是检查容差，不是已验证的识图精度。不承诺与私有 Windows 后台效果一致，不把脚本检查通过当成制造验收。
-
-公开内容仅为本独立技能、辅助脚本和说明，不包含 BDYC 整站、私有后台、账号、密钥、用户图纸或历史任务。脚本不连接开发者电脑；首次安装会访问 PyPI，原稿交给模型后的数据处理规则取决于使用者自己的 AI 助手平台。
+- 0.05 mm 为默认尺寸核对容差。具体还原效果按原稿逐页复核。
 
 ## 授权
 
