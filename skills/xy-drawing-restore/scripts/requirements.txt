@@ -1,5 +1,7 @@
 ezdxf==1.4.4
 Pillow==12.3.0
 matplotlib==3.10.9
+contourpy==1.3.2
+shapely==2.1.2
 pdfplumber==0.11.10
 pypdfium2==5.14.0

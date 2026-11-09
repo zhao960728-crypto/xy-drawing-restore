@@ -31,9 +31,9 @@ def main():
     if not interpreter.is_file():
         raise ValueError('Task Python environment does not exist.')
     code = ('import json, importlib.metadata as m; '
-            'import ezdxf, PIL, matplotlib, pdfplumber, pypdfium2; '
+            'import ezdxf, PIL, matplotlib, contourpy, shapely, pdfplumber, pypdfium2; '
             'print(json.dumps({n:m.version(n) for n in '
-            '["ezdxf","Pillow","matplotlib","pdfplumber","pypdfium2"]}))')
+            '["ezdxf","Pillow","matplotlib","contourpy","shapely","pdfplumber","pypdfium2"]}))')
     result = subprocess.run([str(interpreter), '-c', code], check=True, capture_output=True, text=True)
     print(json.dumps({'python': str(interpreter), 'versions': json.loads(result.stdout)}, ensure_ascii=False))
 

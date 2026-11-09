@@ -11,6 +11,7 @@ import sys
 import uuid
 
 import ezdxf
+import numpy as np
 from PIL import Image, ImageDraw
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
@@ -19,6 +20,8 @@ import yaml
 BASE = Path(__file__).resolve().parents[1]
 PACKAGE = BASE / 'skills/xy-drawing-restore'
 SCRIPT = PACKAGE / 'scripts/restore_tools.py'
+sys.path.insert(0, str(SCRIPT.parent))
+from restoration_geometry import add_cubic_chain, add_native_linear_dimension, restore_raster_ornament
 RUN = BASE / 'work' / ('verification-' + uuid.uuid4().hex[:8])
 RUN.mkdir(parents=True, exist_ok=True)
 
@@ -129,6 +132,120 @@ doc.saveas(wrong_units)
 doc.units = 4
 bad('wrong-units', lambda r: None, wrong_units)
 
+native_doc = ezdxf.readfile(dxf)
+native_space = native_doc.modelspace()
+native_block = native_doc.blocks.new('NATIVE_DIM')
+dimension = add_native_linear_dimension(native_block, (0, 0), (120, 0), (0, -8), 120)
+native_ref = native_space.add_blockref(native_block.name, (0, 0))
+native_dxf = RUN / 'native-dimension.dxf'
+native_doc.saveas(native_dxf)
+native_record = copy.deepcopy(record)
+native_record['pages'][0]['regions'][0]['handles'].append(native_ref.dxf.handle)
+native_record['pages'][0]['dimensions'] = [dict(handle=dimension.dxf.handle, unit='mm',
+                                               source_reading=120, source_text='Source length 120')]
+write(RUN/'native-record.json', native_record)
+native_result = invoke('check', '--manifest', manifest_path, '--dxf', native_dxf,
+                       '--record', RUN/'native-record.json', '--out', RUN/'native-check.json')
+assert native_result['dimensions'][0]['actual'] == 120
+
+def use_native(r):
+    r['pages'][0] = copy.deepcopy(native_record['pages'][0])
+
+def wrong_native_reading(r):
+    use_native(r)
+    r['pages'][0]['dimensions'][0]['source_reading'] = 100
+
+bad('native-dimension-wrong-reading', wrong_native_reading, native_dxf)
+dimension.dxf.text = '120'
+literal_dxf = RUN/'literal-dimension.dxf'
+native_doc.saveas(literal_dxf)
+bad('dimension-literal-override', use_native, literal_dxf)
+dimension.dxf.text = '<>'
+dim_label = next(entity for entity in dimension.get_geometry_block()
+                 if entity.dxftype() in {'TEXT', 'MTEXT'})
+old_label = dim_label.dxf.text
+dim_label.dxf.text = '119'
+wrong_display = RUN/'wrong-dimension-display.dxf'
+native_doc.saveas(wrong_display)
+bad('dimension-visible-text-mismatch', use_native, wrong_display)
+dim_label.dxf.text = old_label
+
+for page in native_record['pages']:
+    page['source_dimension_count'] = len(page.get('dimensions', []))
+    if page['source_dimension_count'] == 0:
+        page['no_dimensions_reason'] = 'The synthetic source has a descriptive label and no dimension annotation.'
+    source = next(row for row in manifest['pages'] if row['id'] == page['id'])
+    with Image.open(manifest_path.parent/source['preview']) as source_preview:
+        page['regions'][0]['source_box_px'] = [0, 0, *source_preview.size]
+write(RUN/'native-record.json', native_record)
+review_dir = RUN/'review-private'
+packed = invoke('review-pack', '--manifest', manifest_path, '--dxf', native_dxf,
+                '--record', RUN/'native-record.json', '--out', review_dir)
+assert packed['status'] == 'awaiting_visual_review'
+pack_path = Path(packed['review_pack'])
+review = json.loads((review_dir/'review-template.json').read_bytes())
+review.update(review_type='self_review', reviewer='Synthetic fixture')
+review_path = RUN/'review.json'
+delivery_path = RUN/'delivery'
+delivery_args = ['deliver', '--manifest', manifest_path, '--dxf', native_dxf, '--record', RUN/'native-record.json',
+                 '--pack', pack_path, '--review', review_path, '--out', delivery_path]
+write(review_path, review)
+assert 'Unresolved' in invoke(*delivery_args, expected=2)['message']
+assert not delivery_path.exists()
+for page in review['pages']:
+    page['status'] = 'passed'
+    for region in page['regions']:
+        region['status'] = 'passed'
+        region['checks'] = {key: 'Synthetic fixture assertion' for key in region['checks']}
+write(review_path, review)
+pack = json.loads(pack_path.read_bytes())
+last_evidence = review_dir/pack['pages'][-1]['regions'][0]['comparison']['path']
+evidence_bytes = last_evidence.read_bytes()
+last_evidence.write_bytes(evidence_bytes+b'changed')
+assert 'changed' in invoke(*delivery_args, expected=2)['message']
+assert not delivery_path.exists()
+last_evidence.write_bytes(evidence_bytes)
+missing = copy.deepcopy(review)
+missing['pages'][-1]['regions'] = []
+write(review_path, missing)
+assert 'cover' in invoke(*delivery_args, expected=2)['message']
+assert not delivery_path.exists()
+write(review_path, review)
+unresolved = copy.deepcopy(native_record)
+unresolved['pages'][-1]['unresolved'] = ['A shape still differs from the original.']
+write(RUN/'unresolved-record.json', unresolved)
+with_unresolved = [RUN/'unresolved-record.json' if value == RUN/'native-record.json' else value
+                   for value in delivery_args]
+assert 'unresolved checks' in invoke(*with_unresolved, expected=2)['message']
+assert not delivery_path.exists()
+delivered = invoke(*delivery_args)
+assert delivered['status'] == 'delivered' and len(delivered['pages']) == 5
+for page in delivered['pages']:
+    assert Path(page['dxf']['path']).stem == Path(page['preview']['path']).stem
+    assert sha(delivery_path/page['dxf']['path']) == page['dxf']['sha256']
+    assert sha(delivery_path/page['preview']['path']) == page['preview']['sha256']
+assert 'new output directory' in invoke(*delivery_args, expected=2)['message']
+
+native_block.add_spline([(0, 0), (15, 20), (30, 0)])
+spline_dxf = RUN/'nested-spline.dxf'
+native_doc.saveas(spline_dxf)
+bad('nested-spline', use_native, spline_dxf)
+assert any('SPLINE' in f for f in negatives['nested-spline'])
+
+geometry_doc = ezdxf.new('R2010')
+geometry = geometry_doc.modelspace()
+arc, bound = add_cubic_chain(geometry, [[(0, 0), (0, 5.5228475), (4.4771525, 10), (10, 10)]], .0125)
+assert arc.dxftype() == 'ARC' and abs(arc.dxf.radius-10) < .0125 and bound <= .0125
+path, _ = add_cubic_chain(geometry, [[(0, 0), (5, 2), (10, 15), (14, 5)],
+                                     [(14, 5), (17, 0), (18, -6), (22, 0)]], .0125)
+assert path.dxftype() == 'LWPOLYLINE' and len(path) > 5
+gray = np.full((24, 32), 255, dtype=np.uint8)
+gray[3:18, 3:16] = gray[6:16, 20:26] = 0
+gray[6:15, 6:13] = 255
+detail = restore_raster_ornament(geometry, gray, [0, 0, 32, 24], lambda p: p)
+assert detail['holes'] == 1 and detail['connected_ink_regions'] == 2
+assert not detail['touches_region_border'] and all(geometry_doc.entitydb[h].dxftype() == 'HATCH' for h in detail['handles'])
+
 block = doc.blocks.new('RASTER_TEST')
 image_def = doc.add_image_def(filename='external-source.png', size_in_pixel=(800, 500))
 block.add_image(image_def, insert=(0, 0), size_in_units=(120, 60))
@@ -158,7 +275,7 @@ preview_record.write_bytes(record_path.read_bytes()); before = sha(preview_recor
 invoke('preview', '--dxf', dxf, '--record', preview_record, '--out', RUN / 'protected.png', expected=2)
 assert sha(preview_record) == before
 meta = yaml.safe_load((PACKAGE / 'SKILL.md').read_text(encoding='utf-8').split('---', 2)[1])
-assert meta['name'] == 'xy-drawing-restore' and meta['metadata']['version'] == '1.0.2'
+assert meta['name'] == 'xy-drawing-restore' and meta['metadata']['version'] == '1.0.3'
 assert meta['metadata']['author'] == 'XY (zhao960728-crypto)'
 summary = {'source_pages': 5, 'scale_anchors': 10, 'dxf_entities': 30, 'negative_cases': len(negatives), 'overwrite_cases': 7, 'status': 'passed', 'model_accuracy_benchmarked': False}
 (RUN / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')

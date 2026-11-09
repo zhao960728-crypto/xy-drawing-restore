@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import shutil
 import sys
 
@@ -175,7 +176,8 @@ def measurement(entities, kind):
     if kind == 'dimension_measurement' and entity.dxftype() == 'DIMENSION':
         if (int(entity.dxf.dimtype) & 15) not in {0, 1, 3, 4}:
             raise ValueError('Only linear, radial and diameter dimensions can be millimeter anchors.')
-        return float(entity.get_measurement())
+        from restoration_geometry import dimension_measurement
+        return dimension_measurement(entity)
     raise ValueError(f'Unsupported anchor/entity combination: {kind}/{entity.dxftype()}')
 
 
@@ -201,8 +203,10 @@ def inspect_dxf(args):
             row['text'] = entity.plain_text()
         if kind == 'DIMENSION':
             try:
-                row['measured_mm'] = measurement([entity], 'dimension_measurement')
-            except ValueError as error:
+                from restoration_geometry import dimension_measurement
+                unit = 'degrees' if entity.dimtype in {2, 5} else 'mm'
+                row['measured_' + unit] = dimension_measurement(entity)
+            except (ValueError, NotImplementedError) as error:
                 row['measurement_note'] = str(error)
         rows.append(row)
     output = {'dxf_sha256': sha(args.dxf), 'units': int(doc.units),
@@ -219,17 +223,84 @@ def finite_number(value, positive=False):
     return float(value)
 
 
-def check(args):
-    protect_output(args.out, [args.manifest, args.dxf, args.record])
-    from ezdxf.disassemble import recursive_decompose
-    manifest_path = Path(args.manifest).resolve()
-    manifest, record = read_json(manifest_path), read_json(args.record)
+def page_native_dimensions(entities, handles):
+    """Follow real block references, retaining saved dimension handles."""
+    todo = [entities[handle] for handle in handles]
+    visited_blocks = set()
+    dimensions = {}
+    while todo:
+        entity = todo.pop()
+        if entity.dxftype() == 'DIMENSION':
+            dimensions[entity.dxf.handle] = entity
+        elif entity.dxftype() == 'INSERT':
+            block = entity.block()
+            if block is not None and block.name not in visited_blocks:
+                visited_blocks.add(block.name)
+                todo.extend(block)
+    return dimensions
+
+
+def check_dimension_inventory(page, dimensions, task_tolerance, findings):
+    from restoration_geometry import dimension_measurement
+
+    label = str(page.get('id'))
+    inventory = page.get('dimensions', [])
+    if not isinstance(inventory, list):
+        findings.append(label + ': invalid source dimension inventory.')
+        return []
+    seen, readings = set(), []
+    for row in inventory:
+        try:
+            handle = row['handle']
+            if handle in seen or handle not in dimensions:
+                raise ValueError('Dimension handle is missing, repeated, or belongs to a different page.')
+            seen.add(handle)
+            entity = dimensions[handle]
+            unit = 'degrees' if entity.dimtype in {2, 5} else 'mm'
+            if row.get('unit') != unit or not str(row.get('source_text', '')).strip():
+                raise ValueError('Record the source annotation text and correct measurement unit.')
+            expected = finite_number(row['source_reading'], positive=True)
+            limit = .05 if unit == 'degrees' else task_tolerance
+            tolerance = finite_number(row.get('tolerance', limit))
+            if tolerance > limit:
+                raise ValueError('Dimension tolerance exceeds the allowed check tolerance.')
+            factor = 1 if unit == 'degrees' else finite_number(entity.override().get('dimlfac', 1), positive=True)
+            if factor != 1 and not str(row.get('projection_basis', '')).strip():
+                raise ValueError('An explicitly projected dimension needs a source projection basis.')
+            actual = dimension_measurement(entity)
+            error = abs(actual*factor-expected)
+            display = entity.get_geometry_block()
+            visible = [e.plain_text().strip() for e in display
+                       if e.dxftype() in {'TEXT', 'MTEXT'} and e.plain_text().strip()] if display else []
+            readings.append({'page': label, 'handle': handle, 'unit': unit, 'source_reading': expected,
+                             'actual': actual, 'projection_factor': factor, 'absolute_error': error,
+                             'visible_text': visible})
+            if error > tolerance + 1e-9:
+                raise ValueError('Actual native dimension measurement differs from the source reading.')
+            if len(visible) == 1:
+                scalar = re.fullmatch(r'(?:(?:[RrØøΦφ⌀]|%%c)\s*)?([+-]?\d+(?:[.,]\d+)?)\s*(?:mm|°)?', visible[0])
+                if scalar and not math.isclose(float(scalar[1].replace(',', '.')), expected, rel_tol=0, abs_tol=1e-9):
+                    raise ValueError('Visible dimension text differs from the source reading.')
+        except (KeyError, ValueError, TypeError, NotImplementedError) as error:
+            findings.append(label + ': ' + str(error))
+    if seen != dimensions.keys():
+        findings.append(label + ': source dimension inventory does not cover all native dimensions.')
+    return readings
+
+
+def source_assets(manifest_path, manifest):
     root = manifest_path.parent
-    frozen_inputs = [asset_path(root, source['path']) for source in manifest['sources']]
-    frozen_inputs += [asset_path(root, page[key]) for page in manifest['pages'] for key in ('preview', 'native') if key in page]
-    protect_output(args.out, frozen_inputs)
-    doc = load_dxf(args.dxf)
-    findings, anchors = [], []
+    return [asset_path(root, source['path']) for source in manifest['sources']] + [
+        asset_path(root, page[key]) for page in manifest['pages'] for key in ('preview', 'native') if key in page]
+
+
+def check_inputs(manifest_path, dxf_path, record_path):
+    from ezdxf.disassemble import recursive_decompose
+    manifest_path = Path(manifest_path).resolve()
+    manifest, record = read_json(manifest_path), read_json(record_path)
+    root = manifest_path.parent
+    doc = load_dxf(dxf_path)
+    findings, anchors, dimension_readings = [], [], []
     entities = {entity.dxf.handle: entity for entity in doc.modelspace()}
     if record.get('manifest_sha256') != sha(manifest_path):
         findings.append('Source manifest fingerprint does not match the record.')
@@ -253,8 +324,20 @@ def check(args):
         findings.append('DXF audit found errors or made in-memory fixes; repair, save and recheck the actual file.')
     for block in doc.blocks:
         for entity in block:
-            if entity.dxftype() in RASTER_TYPES:
-                findings.append('Raster/underlay/proxy entity is not editable restoration: ' + entity.dxftype())
+            kind = entity.dxftype()
+            if kind in RASTER_TYPES:
+                findings.append('Raster/underlay/proxy entity is not editable restoration: ' + kind)
+            elif kind == 'SPLINE' or (kind in {'HATCH', 'MPOLYGON'} and any(
+                    type(edge).__name__ == 'SplineEdge' for boundary in entity.paths
+                    for edge in getattr(boundary, 'edges', ()))):
+                findings.append('SPLINE or spline fill boundary found at ' + entity.dxf.handle)
+            elif kind == 'DIMENSION':
+                display = entity.get_geometry_block()
+                label = entity.dxf.get('text', '<>')
+                if (not display or (label and '<>' not in label)
+                        or not any(item.dxftype() in {'TEXT', 'MTEXT'} and item.plain_text().strip() for item in display)
+                        or any(item.dxftype() in {'HATCH', 'MPOLYGON'} | RASTER_TYPES for item in display)):
+                    findings.append('DIMENSION must display a native editable reading at ' + entity.dxf.handle)
     if any(len(layout) for layout in doc.layouts if layout.name != 'Model'):
         findings.append('This workflow assigns all restored content to modelspace; nonempty paperspace is unaccounted for.')
     tolerance = finite_number(record.get('tolerance_mm'), positive=True)
@@ -265,6 +348,7 @@ def check(args):
     claimed = set()
     for page in pages:
         label = str(page.get('id'))
+        page_handles = set()
         if page.get('unresolved'):
             findings.append(label + ': unresolved source/scale/content questions remain.')
         if page.get('excluded') and record.get('scope') == 'entire_source':
@@ -288,6 +372,7 @@ def check(args):
                 findings.append(tag + ': missing, repeated or cross-region entity handles.')
                 continue
             claimed.update(selected)
+            page_handles.update(selected)
             flattened = list(recursive_decompose([entities[h] for h in handles]))
             geometry = any(entity.dxftype() not in TEXT_TYPES for entity in flattened)
             if region.get('scale_status') == 'no_geometric_content':
@@ -322,24 +407,40 @@ def check(args):
                         findings.append(tag + ': measured geometry does not match its source scale anchor.')
                 except (KeyError, TypeError, ValueError) as error:
                     findings.append(tag + ': ' + str(error))
+        dimensions = page_native_dimensions(entities, page_handles)
+        dimension_readings.extend(check_dimension_inventory(page, dimensions, tolerance, findings))
     if claimed != entities.keys():
         findings.append('Actual modelspace entities are not completely assigned to source pages/regions.')
-    result = {'automated_checks': 'failed' if findings else 'passed',
+    return {'automated_checks': 'failed' if findings else 'passed',
               'restoration_acceptance': 'requires_visual_review',
-              'manifest_sha256': sha(manifest_path), 'record_sha256': sha(args.record),
-              'dxf_sha256': sha(args.dxf), 'findings': findings, 'anchors': anchors,
+              'manifest_sha256': sha(manifest_path), 'record_sha256': sha(record_path),
+              'dxf_sha256': sha(dxf_path), 'findings': findings, 'anchors': anchors,
+              'dimensions': dimension_readings,
               'limitations': ['Reference text/derivations are declarations that require source-image review.',
                               'This does not verify all source geometry, wording, layout or fabrication.']}
+
+
+def check(args):
+    manifest_path = Path(args.manifest).resolve()
+    protect_output(args.out, [manifest_path, args.dxf, args.record])
+    protect_output(args.out, source_assets(manifest_path, read_json(manifest_path)))
+    result = check_inputs(manifest_path, args.dxf, args.record)
     write_json(args.out, result)
     return result
 
 
-def preview(args):
+def render_dxf_png(doc, path, selected=None):
     import matplotlib
     matplotlib.use('Agg')
-    from PIL import Image
     from ezdxf.addons.drawing.config import Configuration
     from ezdxf.addons.drawing.matplotlib import qsave
+    qsave(doc.modelspace(), str(path), bg='#ffffff', fg='#000000', dpi=240,
+          config=Configuration(min_lineweight=1.5), size_inches=(16, 12),
+          filter_func=None if selected is None else lambda entity: entity.dxf.handle in selected)
+
+
+def preview(args):
+    from PIL import Image
     doc = load_dxf(args.dxf)
     target = Path(args.out).resolve()
     if target.suffix.lower() != '.png':
@@ -351,10 +452,7 @@ def preview(args):
 
     def render(path, selected=None):
         protect_output(path, inputs)
-        qsave(doc.modelspace(), str(path), bg='#ffffff', fg='#000000', dpi=240,
-              config=Configuration(min_lineweight=1.5),
-              size_inches=(16, 12),
-              filter_func=None if selected is None else lambda entity: entity.dxf.handle in selected)
+        render_dxf_png(doc, path, selected)
         outputs.append(path)
         # Non-overlapping readable tiles of the actual rendered DXF.
         with Image.open(path) as image:
@@ -405,6 +503,15 @@ def main():
         if name == 'check':
             p.add_argument('--manifest', required=True)
             p.add_argument('--record', required=True)
+        p.set_defaults(func=func)
+    from delivery import review_pack, deliver
+    for name, func in (('review-pack', review_pack), ('deliver', deliver)):
+        p = sub.add_parser(name)
+        for field in ('manifest', 'dxf', 'record', 'out'):
+            p.add_argument('--'+field, required=True)
+        if name == 'deliver':
+            p.add_argument('--pack', required=True)
+            p.add_argument('--review', required=True)
         p.set_defaults(func=func)
     args = parser.parse_args()
     if getattr(args, 'max_pixels', 1) <= 0:

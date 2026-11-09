@@ -7,6 +7,8 @@
 | ezdxf | 1.4.4 | MIT | [PyPI](https://pypi.org/project/ezdxf/1.4.4/) |
 | Pillow | 12.3.0 | MIT-CMU；所用发行物内其他组件分别声明 | [PyPI](https://pypi.org/project/Pillow/12.3.0/) |
 | matplotlib | 3.10.9 | Matplotlib License Agreement；附带组件及字体各有许可 | [PyPI](https://pypi.org/project/matplotlib/3.10.9/) |
+| ContourPy | 1.3.2 | BSD-3-Clause | [PyPI](https://pypi.org/project/contourpy/1.3.2/) |
+| Shapely | 2.1.2 | BSD-3-Clause；随发行物提供的 GEOS 另有许可声明 | [PyPI](https://pypi.org/project/shapely/2.1.2/) |
 | pdfplumber | 0.11.10 | MIT | [PyPI](https://pypi.org/project/pdfplumber/0.11.10/) |
 | pypdfium2 | 5.14.0 | Apache-2.0 / BSD-3-Clause；PDFium 与所含组件另有声明 | [PyPI](https://pypi.org/project/pypdfium2/5.14.0/) |
 

@@ -5,12 +5,14 @@
 from pathlib import Path
 import hashlib
 import json
+import re
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / 'skills/xy-drawing-restore'
 FILES = ['SKILL.md', 'references/workflow.md', 'scripts/bootstrap.py',
-         'scripts/restore_tools.py', 'scripts/requirements.txt']
+         'scripts/restore_tools.py', 'scripts/restoration_geometry.py', 'scripts/delivery.py',
+         'scripts/page_exports.py', 'scripts/requirements.txt']
 NOTICES = ['LICENSE', 'NOTICE', 'COMMERCIAL_USE.md', 'THIRD_PARTY_NOTICES.md']
 
 
@@ -19,7 +21,9 @@ def main():
         (SKILL / name).write_bytes((ROOT / name).read_bytes())
     output = ROOT / 'dist'
     output.mkdir(exist_ok=True)
-    archive = output / 'xy-drawing-restore-1.0.2.zip'
+    metadata = (SKILL / 'SKILL.md').read_text('utf-8').split('---', 2)[1]
+    version = re.search(r'^  version: (\d+\.\d+\.\d+)$', metadata, re.M).group(1)
+    archive = output / f'xy-drawing-restore-{version}.zip'
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for name in FILES + NOTICES:
             path = SKILL / name
