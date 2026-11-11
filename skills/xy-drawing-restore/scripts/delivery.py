@@ -290,7 +290,7 @@ def deliver(args):
             shutil.copyfile(actual_png, png)
             if sha(dxf) != row['dxf']['sha256'] or sha(png) != row['preview']['sha256']:
                 raise ValueError('Reviewed output changed during delivery.')
-            verify_page_dxf(doc.units, redraw[page_id], dxf)
+            verify_page_dxf(doc, redraw[page_id], dxf)
             delivered.append({**page_binding, 'dxf': item(dxf), 'preview': item(png)})
         current = check_inputs(args.manifest, args.dxf, args.record)
         if current != checks or sha(pack_path) != pack_sha or sha(review_path) != review_sha:

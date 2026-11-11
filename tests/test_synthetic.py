@@ -23,7 +23,7 @@ PACKAGE = BASE / 'skills/xy-drawing-restore'
 SCRIPT = PACKAGE / 'scripts/restore_tools.py'
 sys.path.insert(0, str(SCRIPT.parent))
 from delivery import cad_frame, paper_width, source_is_dark
-from page_exports import verify_page_dxf
+from page_exports import verify_page_dxf, write_page_dxf
 from restoration_geometry import (add_cubic_chain, add_filled_paths, add_native_linear_dimension,
                                   restore_color_artwork, restore_raster_ornament)
 from restore_tools import check_dimension_inventory, check_embedded_images, feet_inches_mm, render_dxf_png, source_image_ids
@@ -173,6 +173,23 @@ dim_label.dxf.text = '119'
 wrong_display = RUN/'wrong-dimension-display.dxf'
 native_doc.saveas(wrong_display)
 bad('dimension-visible-text-mismatch', use_native, wrong_display)
+dim_label.dxf.text = old_label
+
+for name, source_label, visible_label, message in (
+        ('unreadable', '120', 'WRONG', 'cannot be read'),
+        ('missing-radius', 'R120', '120', 'qualifier'),
+        ('wrong-diameter', '⌀120', 'R120', 'qualifier'),
+        ('wrong-unit', '120', '120°', 'measurement unit')):
+    dim_label.dxf.text = visible_label
+    altered = RUN / f'dimension-{name}.dxf'
+    native_doc.saveas(altered)
+
+    def use_label(r):
+        use_native(r)
+        r['pages'][0]['dimensions'][0]['source_text'] = source_label
+
+    bad(f'dimension-{name}', use_label, altered)
+    assert any(message in finding for finding in negatives[f'dimension-{name}'])
 dim_label.dxf.text = old_label
 
 for page in native_record['pages']:
@@ -396,11 +413,40 @@ changed.commit()
 feet_doc.saveas(different_style)
 feet_dim.commit()
 try:
-    verify_page_dxf(feet_doc.units, list(feet_doc.modelspace()), different_style)
+    verify_page_dxf(feet_doc, list(feet_doc.modelspace()), different_style)
 except ValueError as error:
     assert 'styles' in str(error)
 else:
     raise AssertionError('Readback accepted a change to the native dimension overrides.')
+
+styled_master = RUN / 'styled-master.dxf'
+styled_doc = ezdxf.new('R2010', units=4)
+styled_doc.header['$LTSCALE'] = 2.5
+styled_doc.linetypes.new('CUSTOM_DASH', dxfattribs={'pattern': [6, 4, -2]})
+styled_doc.layers.get('0').dxf.update({'color': 3, 'linetype': 'CUSTOM_DASH', 'lineweight': 25})
+styled_doc.layers.new('VIEW', dxfattribs={'color': 1})
+block = styled_doc.blocks.new('PART')
+block.add_line((0, 0), (5, 0))
+styled_doc.modelspace().add_line((0, 5), (10, 5))
+styled_doc.modelspace().add_blockref('PART', (10, 0), dxfattribs={'layer': 'VIEW'})
+styled_doc.saveas(styled_master)
+styled_doc = ezdxf.readfile(styled_master)
+styled_entities = list(styled_doc.modelspace())
+styled_page = RUN / 'styled-page.dxf'
+exported = write_page_dxf(styled_doc, [e.dxf.handle for e in styled_entities], styled_entities, styled_page)
+assert exported.layers.get('0').dxf.color == 3
+assert exported.layers.get('0').dxf.lineweight == 25
+assert exported.layers.get('0').dxf.linetype == 'CUSTOM_DASH'
+assert exported.blocks.get('PART')[0].dxf.layer == '0'
+assert exported.header['$LTSCALE'] == 2.5
+exported.header['$LTSCALE'] = 7.5
+exported.saveas(styled_page)
+try:
+    verify_page_dxf(styled_doc, styled_entities, styled_page)
+except ValueError as error:
+    assert '$LTSCALE' in str(error)
+else:
+    raise AssertionError('Readback accepted a change to the drawing-wide linetype scale.')
 
 meta = yaml.safe_load((PACKAGE / 'SKILL.md').read_text(encoding='utf-8').split('---', 2)[1])
 assert meta['name'] == 'xy-drawing-restore' and meta['metadata']['version'] == '1.0.3'

@@ -267,13 +267,15 @@ def feet_inches_mm(text):
 
 def metric_label(text):
     match = re.fullmatch(
-        r'(?:(\d+)\s*[-x×]\s*)?(?:(M|[RrØøΦφ⌀]|%%c)\s*)?([+-]?\d+(?:[.,]\d+)?)\s*(?:mm|°)?',
-        text.strip())
+        r'(?:(\d+)\s*[-x×]\s*)?(?:(M|[RØΦ⌀]|%%c)\s*)?([+-]?\d+(?:[.,]\d+)?)\s*(mm|°)?',
+        text.strip(), re.IGNORECASE)
     if match is None:
         return None
-    quantity, prefix, value = match.groups()
-    qualifier = prefix.upper() if prefix in {'M', 'R', 'r'} else 'diameter' if prefix else None
-    return float(value.replace(',', '.')), qualifier, int(quantity) if quantity is not None else None
+    quantity, prefix, value, suffix = match.groups()
+    prefix = prefix.upper() if prefix else None
+    qualifier = prefix if prefix in {'M', 'R'} else 'diameter' if prefix else None
+    unit = 'degrees' if suffix == '°' else 'mm' if suffix else None
+    return float(value.replace(',', '.')), qualifier, int(quantity) if quantity is not None else None, unit
 
 
 def check_dimension_inventory(page, dimensions, task_tolerance, findings):
@@ -330,13 +332,16 @@ def check_dimension_inventory(page, dimensions, task_tolerance, findings):
             else:
                 scalar = metric_label(visible[0]) if len(visible) == 1 else None
                 source_label = metric_label(source_text)
+                if any(label and label[3] not in {None, unit} for label in (source_label, scalar)):
+                    raise ValueError('Source or visible dimension text uses a different measurement unit.')
                 if source_label and not math.isclose(source_label[0], expected, rel_tol=0, abs_tol=1e-9):
                     raise ValueError('Source dimension text differs from the recorded reading.')
                 if scalar and not math.isclose(scalar[0], expected, rel_tol=0, abs_tol=1e-9):
                     raise ValueError('Visible dimension text differs from the source reading.')
-                if source_label and (source_label[1] == 'M' or source_label[2] is not None):
-                    if scalar is None or source_label[1:] != scalar[1:]:
-                        raise ValueError('Visible dimension thread or quantity qualifier differs from the source.')
+                if source_label and scalar is None:
+                    raise ValueError('Visible dimension text is missing or cannot be read as the source annotation.')
+                if source_label and source_label[1:3] != scalar[1:3]:
+                    raise ValueError('Visible dimension radius, diameter, thread or quantity qualifier differs from the source.')
         except (KeyError, ValueError, TypeError, NotImplementedError) as error:
             findings.append(label + ': ' + str(error))
     if seen != dimensions.keys():

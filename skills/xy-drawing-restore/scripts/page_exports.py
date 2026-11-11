@@ -5,6 +5,9 @@ import hashlib
 import json
 
 
+PAGE_HEADER_VARS = ('$MEASUREMENT', '$LTSCALE', '$CELTSCALE', '$LWDISPLAY', '$FILLMODE', '$PDMODE', '$PDSIZE')
+
+
 def _payload(entity, stack=()):
     from ezdxf.lldxf.tagwriter import TagCollector
     doc=entity.doc
@@ -61,7 +64,8 @@ def _payload(entity, stack=()):
         if t.code in skip:continue
         if t.code==2 and kind in {'INSERT','DIMENSION'}:continue
         if t.code==3 and kind=='DIMENSION':continue
-        if t.code==8:value=table(doc.layers.get(str(t.value)))
+        if t.code == 8:
+            value = {'inherits_insert_layer': t.value == '0', 'layer': table(doc.layers.get(str(t.value)))}
         elif t.code==7 and kind in {'TEXT','MTEXT','ATTRIB','ATTDEF'}:value=table(doc.styles.get(str(t.value)))
         elif t.code==6 and str(t.value).upper() not in {'BYLAYER','BYBLOCK'}:value=table(doc.linetypes.get(str(t.value)))
         else:value=str(t.value)
@@ -82,14 +86,17 @@ def _signature(entity):
     return hashlib.sha256(json.dumps(_payload(entity),sort_keys=True,default=str).encode()).hexdigest()
 
 
-def verify_page_dxf(units, redraw_entities, path):
+def verify_page_dxf(document, redraw_entities, path):
     import ezdxf
 
     expected = [_signature(entity) for entity in redraw_entities]
     reopened = ezdxf.readfile(str(path))
     audit = reopened.audit()
-    if audit.has_errors or audit.has_fixes or reopened.units != units:
+    if audit.has_errors or audit.has_fixes or reopened.units != document.units:
         raise ValueError('Saved page DXF requires repair or changed units.')
+    changed = [name for name in PAGE_HEADER_VARS if reopened.header.get(name) != document.header.get(name)]
+    if changed:
+        raise ValueError('Saved page DXF changed drawing display settings: ' + ', '.join(changed))
     actual = [_signature(entity) for entity in reopened.modelspace().entities_in_redraw_order()]
     if actual != expected:
         raise ValueError('Saved page DXF changed geometry, styles, blocks or dimension display.')
@@ -104,11 +111,21 @@ def write_page_dxf(document, ordered_handles, redraw_entities, path):
     wanted = set(ordered_handles)
     target = ezdxf.new(document.dxfversion)
     target.units = document.units
-    for name in ('$MEASUREMENT', '$LTSCALE', '$CELTSCALE', '$LWDISPLAY', '$FILLMODE', '$PDMODE', '$PDSIZE'):
+    for name in PAGE_HEADER_VARS:
         if name in document.header:
             target.header[name] = document.header[name]
-    xref.load_modelspace(document, target, filter_fn=lambda entity: entity.dxf.handle in wanted,
-                         conflict_policy=xref.ConflictPolicy.NUM_PREFIX)
+    # ezdxf reserves layer 0 and does not import it with modelspace entities.
+    # Its name must survive because block contents inherit the INSERT's layer.
+    source_layer = document.layers.get('0')
+    target_layer = target.layers.get('0')
+    for name in ('flags', 'color', 'true_color', 'linetype', 'plot', 'lineweight', 'unknown1'):
+        if source_layer.dxf.hasattr(name):
+            target_layer.dxf.set(name, source_layer.dxf.get(name))
+    loader = xref.Loader(document, target, conflict_policy=xref.ConflictPolicy.NUM_PREFIX)
+    if source_layer.dxf.linetype not in target.linetypes:
+        loader.load_linetypes([source_layer.dxf.linetype])
+    loader.load_modelspace(filter_fn=lambda entity: entity.dxf.handle in wanted)
+    loader.execute()
     model = target.modelspace()
     imported = list(model)
     if len(imported) != len(ordered_handles):
@@ -117,4 +134,4 @@ def write_page_dxf(document, ordered_handles, redraw_entities, path):
     model.set_redraw_order([(mapping[entity.dxf.handle], f'{i:X}')
                             for i, entity in enumerate(redraw_entities, 1)])
     target.saveas(str(path))
-    return verify_page_dxf(document.units, redraw_entities, path)
+    return verify_page_dxf(document, redraw_entities, path)
